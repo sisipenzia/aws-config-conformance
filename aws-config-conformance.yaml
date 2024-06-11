@@ -1,0 +1,288 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: AWS Config Setup with Multiple Managed Conformance Packs
+
+########################################################## Parameters ###################################################################
+Parameters:
+  ConfigBucketName:
+    Type: String
+    Default: config-bucket-conformance
+    Description: Name of the S3 bucket to store AWS Config logs
+  GitHubRawFileURL1:
+    Type: String
+    Description: The raw URL of the first GitHub file containing the conformance pack.
+    Default: https://raw.githubusercontent.com/awslabs/aws-config-rules/master/aws-config-conformance-packs/Operational-Best-Practices-for-AWS-Identity-and-Access-Management.yaml
+  GitHubRawFileURL2:
+    Type: String
+    Description: The raw URL of the second GitHub file containing the conformance pack.
+    Default: https://raw.githubusercontent.com/awslabs/aws-config-rules/master/aws-config-conformance-packs/Operational-Best-Practices-for-AWS-Well-Architected-Reliability-Pillar.yaml
+  GitHubRawFileURL3:
+    Type: String
+    Description: The raw URL of the third GitHub file containing the conformance pack.
+    Default: https://raw.githubusercontent.com/awslabs/aws-config-rules/master/aws-config-conformance-packs/Operational-Best-Practices-for-AWS-Well-Architected-Security-Pillar.yaml
+  ConformancePackNameIAM:
+    Type: String
+    Default: IAMConformancePack
+    Description: The name of the IAM AWS Config Conformance Pack.
+  ConformancePackNameSecurity:
+    Type: String
+    Default: SecurityConformancePack
+    Description: The name of the Security AWS Config Conformance Pack.
+  ConformancePackNameReliability:
+    Type: String
+    Default: ReliabilityConformancePack
+    Description: The name of the Reliability AWS Config Conformance Pack.
+
+########################################################## Resources ###################################################################
+
+Resources:
+  ConfigBucket:
+    DeletionPolicy: Retain
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref ConfigBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  ConfigBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DependsOn: ConfigBucket
+    Properties:
+      Bucket: !Ref ConfigBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: AWSConfigBucketPermissionsCheck
+            Effect: Allow
+            Principal:
+              Service:
+                - config.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${ConfigBucket}"
+            Condition:
+              StringEquals:
+                AWS:SourceAccount: !Ref "AWS::AccountId"
+          - Sid: AWSConfigBucketDelivery
+            Effect: Allow
+            Principal:
+              Service:
+                - config.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${ConfigBucket}/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceAccount: !Ref "AWS::AccountId"
+          - Sid: AWSConfigBucketSecureTransport
+            Action:
+              - s3:*
+            Effect: Deny
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${ConfigBucket}"
+              - !Sub "arn:${AWS::Partition}:s3:::${ConfigBucket}/*"
+            Principal: "*"
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    DependsOn: [ConfigBucketPolicy, LambdaInvoke]
+    Properties:
+      Name: config-recorder
+      RoleARN: !GetAtt ConfigRole.Arn
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: true
+
+  ConfigRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWS_ConfigRole
+      Policies:
+        - PolicyName: ConfigS3AccessPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${ConfigBucketName}/*"
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::${ConfigBucketName}"
+
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    DependsOn: [ConfigBucketPolicy, ConfigRecorder]
+    Properties:
+      Name: config-delivery-channel
+      S3BucketName: !Ref ConfigBucket
+
+  ########################################################## Lambda Function to get conformance packs #######################################################
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaS3AccessPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub "arn:aws:s3:::${ConfigBucket}/*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "arn:aws:logs:*:*:*"
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GitHubRawToS3Lambda
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 900
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib.request
+          import os
+          import logging
+
+          s3 = boto3.client('s3')
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def download_and_upload(url, bucket_name, s3_key):
+              try:
+                  logger.info(f"Downloading from {url}")
+                  response = urllib.request.urlopen(url)
+                  content = response.read()
+                  file_path = '/tmp/' + s3_key
+
+                  with open(file_path, 'wb') as f:
+                      f.write(content)
+
+                  logger.info(f"Uploading to s3://{bucket_name}/{s3_key}")
+                  s3.upload_file(file_path, bucket_name, s3_key)
+              except Exception as e:
+                  logger.error(f"Error downloading or uploading file: {e}")
+                  raise
+
+          def handler(event, context):
+              try:
+                  logging.info(f"Files: {event['ResourceProperties']['files']}")
+
+                  files = event['ResourceProperties']['files']
+                  bucket_name = event['ResourceProperties']['bucket_name']
+
+                  for file in files:
+                      download_and_upload(file['url'], bucket_name, file['s3_key'])
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Files uploaded to S3 successfully!')
+                  }
+              except Exception as e:
+                  logger.error(f"Error in handler: {e}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f"Error: {e}")
+                  }
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: cloudformation.amazonaws.com
+
+  LambdaInvoke:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: LambdaPermission
+    Properties:
+      ServiceToken: !GetAtt LambdaFunction.Arn
+      files:
+        - url: !Ref GitHubRawFileURL1
+          s3_key: iam-conformance-pack.yaml
+        - url: !Ref GitHubRawFileURL2
+          s3_key: security-conformance-pack.yaml
+        - url: !Ref GitHubRawFileURL3
+          s3_key: reliability-conformance-pack.yaml
+      bucket_name: !Ref ConfigBucket
+
+  ########################################################## Config Rules #################################################################
+
+  ########################################################## Conformance Packs ############################################################
+
+  IAMConformancePack:
+    Type: AWS::Config::ConformancePack
+    DependsOn: LambdaInvoke
+    Properties:
+      ConformancePackName: !Ref ConformancePackNameIAM
+      DeliveryS3Bucket: !Ref ConfigBucket
+      TemplateS3Uri: !Sub "s3://${ConfigBucket}/iam-conformance-pack.yaml"
+      DeliveryS3KeyPrefix: ""
+
+  SecurityConformancePack:
+    Type: AWS::Config::ConformancePack
+    DependsOn: LambdaInvoke
+    Properties:
+      ConformancePackName: !Ref ConformancePackNameSecurity
+      DeliveryS3Bucket: !Ref ConfigBucket
+      TemplateS3Uri: !Sub "s3://${ConfigBucket}/security-conformance-pack.yaml"
+      DeliveryS3KeyPrefix: ""
+
+  ReliabilityConformancePack:
+    Type: AWS::Config::ConformancePack
+    DependsOn: LambdaInvoke
+    Properties:
+      ConformancePackName: !Ref ConformancePackNameReliability
+      DeliveryS3Bucket: !Ref ConfigBucket
+      TemplateS3Uri: !Sub "s3://${ConfigBucket}/reliability-conformance-pack.yaml"
+      DeliveryS3KeyPrefix: ""
+
+########################################################## Outputs ###################################################################
+
+Outputs:
+  ConfigBucket:
+    Description: Name of the S3 bucket created
+    Value: !Ref ConfigBucket
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt LambdaFunction.Arn
+  IAMConformancePackName:
+    Description: Name of the IAM AWS Config Conformance Pack
+    Value: !Ref ConformancePackNameIAM
+  SecurityConformancePackName:
+    Description: Name of the Security AWS Config Conformance Pack
+    Value: !Ref ConformancePackNameSecurity
+  ReliabilityConformancePackName:
+    Description: Name of the Reliability AWS Config Conformance Pack
+    Value: !Ref ConformancePackNameReliability
+  LambdaInvoke:
+    Description: Lambda Invoke
+    Value: !Ref LambdaInvoke
