@@ -171,6 +171,7 @@ Resources:
           import urllib.request
           import os
           import logging
+          import cfnresponse
 
           s3 = boto3.client('s3')
           logger = logging.getLogger()
@@ -192,22 +193,35 @@ Resources:
                   logger.error(f"Error downloading or uploading file: {e}")
                   raise
 
+          def handle_delete():
+              pass
+
           def handler(event, context):
               try:
-                  logging.info(f"Files: {event['ResourceProperties']['files']}")
+                  if event['RequestType'] == 'Delete':
+                      # Handle Create operation
+                      handle_delete(event)
 
+                  logging.info(f"Files: {event['ResourceProperties']['files']}")
+                  logging.info("==========================================================================")
+                  logging.info(f"Event: {event}")
+                  
                   files = event['ResourceProperties']['files']
                   bucket_name = event['ResourceProperties']['bucket_name']
 
                   for file in files:
                       download_and_upload(file['url'], bucket_name, file['s3_key'])
-
+                  
+                  # Send success response back to CloudFormation
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physical_resource_id=event.get('PhysicalResourceId')
+                  
                   return {
                       'statusCode': 200,
                       'body': json.dumps('Files uploaded to S3 successfully!')
                   }
               except Exception as e:
                   logger.error(f"Error in handler: {e}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
                   return {
                       'statusCode': 500,
                       'body': json.dumps(f"Error: {e}")
