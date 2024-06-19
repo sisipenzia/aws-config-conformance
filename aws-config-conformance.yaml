@@ -173,59 +173,79 @@ Resources:
           import logging
           import cfnresponse
 
-          s3 = boto3.client('s3')
+          s3 = boto3.client("s3")
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
+
 
           def download_and_upload(url, bucket_name, s3_key):
               try:
                   logger.info(f"Downloading from {url}")
                   response = urllib.request.urlopen(url)
                   content = response.read()
-                  file_path = '/tmp/' + s3_key
+                  file_path = "/tmp/" + s3_key
 
-                  with open(file_path, 'wb') as f:
+                  with open(file_path, "wb") as f:
                       f.write(content)
 
                   logger.info(f"Uploading to s3://{bucket_name}/{s3_key}")
                   s3.upload_file(file_path, bucket_name, s3_key)
+
               except Exception as e:
                   logger.error(f"Error downloading or uploading file: {e}")
                   raise
 
-          def handle_delete():
-              pass
+
+          def handle_delete(event, context):
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
 
           def handler(event, context):
               try:
-                if event['RequestType'] == 'Delete':
-                    # Handle Create operation
-                    handle_delete(event)
+                  if "ResponseURL" not in event:
+                      raise KeyError("ResponseURL")
 
-                logging.info(f"Files: {event['ResourceProperties']['files']}")
-                logging.info("==========================================================================")
-                logging.info(f"Event: {event}")
+                  if event["RequestType"] == "Delete":
+                      # Handle Create operation
+                      handle_delete(event)
 
-                files = event['ResourceProperties']['files']
-                bucket_name = event['ResourceProperties']['bucket_name']
+                  logging.info(f"Files: {event['ResourceProperties']['files']}")
+                  logging.info(
+                      "=========================================================================="
+                  )
 
-                for file in files:
-                    download_and_upload(file['url'], bucket_name, file['s3_key'])
-                
-                # Send success response back to CloudFormation
-                cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physical_resource_id=event.get('PhysicalResourceId')
-                  
-                return {
-                    'statusCode': 200,
-                    'body': json.dumps('Files uploaded to S3 successfully!')
-                }
+                  logging.info(f"Event: {event}")
+
+                  files = event["ResourceProperties"]["files"]
+                  bucket_name = event["ResourceProperties"]["bucket_name"]
+
+                  for file in files:
+                      download_and_upload(file["url"], bucket_name, file["s3_key"])
+
+                  # Send success response back to CloudFormation
+                  cfnresponse.send(
+                      event,
+                      context,
+                      cfnresponse.SUCCESS,
+                      {},
+                      physical_resource_id=event.get("PhysicalResourceId"),
+                  )
+
+                  return {
+                      "statusCode": 200,
+                      "body": json.dumps("Files uploaded to S3 successfully!"),
+                  }
+
+              except KeyError as e:
+                  logger.error(f"Missing key in event: {e}")
+                  cfnresponse.send(
+                      event, context, cfnresponse.FAILED, {"Error": "Missing key in event"}
+                  )
+
               except Exception as e:
                   logger.error(f"Error in handler: {e}")
                   cfnresponse.send(event, context, cfnresponse.FAILED, {})
-                  return {
-                      'statusCode': 500,
-                      'body': json.dumps(f"Error: {e}")
-                  }
+                  # return {"statusCode": 500, "body": json.dumps(f"Error: {e}")}
 
   LambdaPermission:
     Type: AWS::Lambda::Permission
