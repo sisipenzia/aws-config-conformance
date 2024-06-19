@@ -198,27 +198,27 @@ Resources:
 
           def handler(event, context):
               try:
-                  if event['RequestType'] == 'Delete':
-                      # Handle Create operation
-                      handle_delete(event)
+                if event['RequestType'] == 'Delete':
+                    # Handle Create operation
+                    handle_delete(event)
 
-                  logging.info(f"Files: {event['ResourceProperties']['files']}")
-                  logging.info("==========================================================================")
-                  logging.info(f"Event: {event}")
-                  
-                  files = event['ResourceProperties']['files']
-                  bucket_name = event['ResourceProperties']['bucket_name']
+                logging.info(f"Files: {event['ResourceProperties']['files']}")
+                logging.info("==========================================================================")
+                logging.info(f"Event: {event}")
 
-                  for file in files:
-                      download_and_upload(file['url'], bucket_name, file['s3_key'])
+                files = event['ResourceProperties']['files']
+                bucket_name = event['ResourceProperties']['bucket_name']
+
+                for file in files:
+                    download_and_upload(file['url'], bucket_name, file['s3_key'])
+                
+                # Send success response back to CloudFormation
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physical_resource_id=event.get('PhysicalResourceId')
                   
-                  # Send success response back to CloudFormation
-                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physical_resource_id=event.get('PhysicalResourceId')
-                  
-                  return {
-                      'statusCode': 200,
-                      'body': json.dumps('Files uploaded to S3 successfully!')
-                  }
+                return {
+                    'statusCode': 200,
+                    'body': json.dumps('Files uploaded to S3 successfully!')
+                }
               except Exception as e:
                   logger.error(f"Error in handler: {e}")
                   cfnresponse.send(event, context, cfnresponse.FAILED, {})
@@ -247,8 +247,6 @@ Resources:
         - url: !Ref GitHubRawFileURL3
           s3_key: reliability-conformance-pack.yaml
       bucket_name: !Ref ConfigBucket
-
-  ########################################################## Config Rules #################################################################
 
   ########################################################## Conformance Packs ############################################################
 
