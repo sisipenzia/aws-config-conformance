@@ -2,3 +2,5 @@ ignore-files
 security
 config
 lambda.py
+aws-config-test.yaml
+lambda-config.py

@@ -47,7 +47,6 @@ Resources:
 
   ConfigBucketPolicy:
     Type: AWS::S3::BucketPolicy
-    DependsOn: ConfigBucket
     Properties:
       Bucket: !Ref ConfigBucket
       PolicyDocument:
@@ -87,7 +86,6 @@ Resources:
 
   ConfigRecorder:
     Type: AWS::Config::ConfigurationRecorder
-    DependsOn: [ConfigBucketPolicy, LambdaInvoke]
     Properties:
       Name: config-recorder
       RoleARN: !GetAtt ConfigRole.Arn
@@ -123,7 +121,7 @@ Resources:
 
   ConfigDeliveryChannel:
     Type: AWS::Config::DeliveryChannel
-    DependsOn: [ConfigBucketPolicy, ConfigRecorder]
+    # DependsOn: [ConfigBucketPolicy, ConfigRecorder]
     Properties:
       Name: config-delivery-channel
       S3BucketName: !Ref ConfigBucket
@@ -147,36 +145,64 @@ Resources:
               - Effect: Allow
                 Action:
                   - s3:PutObject
-                Resource: !Sub "arn:aws:s3:::${ConfigBucket}/*"
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${ConfigBucket}"
+                  - !Sub "arn:aws:s3:::${ConfigBucket}/*"
+              - Effect: Allow
+                Action:
+                  - s3:DeleteBucket
+                Resource: !Sub "arn:aws:s3:::${ConfigBucket}"
               - Effect: Allow
                 Action:
                   - logs:CreateLogGroup
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                 Resource: "arn:aws:logs:*:*:*"
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                Resource: "*"
 
   LambdaFunction:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: GitHubRawToS3Lambda
-      Handler: index.handler
+      Handler: index.lambda_handler
       Role: !GetAtt LambdaExecutionRole.Arn
-      Runtime: python3.9
-      Timeout: 900
+      Runtime: python3.8
+      Timeout: 300
       MemorySize: 256
       Code:
         ZipFile: |
           import json
-          import boto3
-          import urllib.request
-          import os
           import logging
+          import boto3
           import cfnresponse
+          import urllib.request
 
-          s3 = boto3.client("s3")
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
 
+          s3 = boto3.client("s3")
+          cloudformation = boto3.client("cloudformation")
+
+          def delete_bucket(bucket_name):
+              try:
+                  # First, delete all objects in the bucket
+                  paginator = s3.get_paginator("list_objects_v2")
+                  for page in paginator.paginate(Bucket=bucket_name):
+                      if "Contents" in page:
+                          objects = [{"Key": obj["Key"]} for obj in page["Contents"]]
+                          s3.delete_objects(Bucket=bucket_name, Delete={"Objects": objects})
+
+                  # Then, delete the bucket itself
+                  s3.delete_bucket(Bucket=bucket_name)
+                  logger.info(f"Successfully deleted bucket: {bucket_name}")
+              except Exception as e:
+                  logger.error(f"Error deleting bucket {bucket_name}: {str(e)}")
+                  raise
 
           def download_and_upload(url, bucket_name, s3_key):
               try:
@@ -196,56 +222,62 @@ Resources:
                   raise
 
 
-          def handle_delete(event, context):
-              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+          def lambda_handler(event, context):
+              logger.info(f"Received event: {json.dumps(event, indent=2)}")
 
-
-          def handler(event, context):
               try:
-                  if "ResponseURL" not in event:
-                      raise KeyError("ResponseURL")
-
                   if event["RequestType"] == "Delete":
-                      # Handle Create operation
-                      handle_delete(event)
+                      logger.info("Handling Delete request")
+                      bucket_name = event["ResourceProperties"].get("bucket_name")
 
-                  logging.info(f"Files: {event['ResourceProperties']['files']}")
-                  logging.info(
-                      "=========================================================================="
-                  )
+                      if bucket_name:
+                          delete_bucket(bucket_name)
+                          logger.info(f"Successfully deleted bucket: {bucket_name}")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
 
-                  logging.info(f"Event: {event}")
+                  if event["RequestType"] in ["Create", "Update"]:
+                      files = event["ResourceProperties"].get("files", [])
+                      bucket_name = event["ResourceProperties"].get("bucket_name")
 
-                  files = event["ResourceProperties"]["files"]
-                  bucket_name = event["ResourceProperties"]["bucket_name"]
+                      if not bucket_name:
+                          raise ValueError("bucket_name is required in ResourceProperties")
 
-                  for file in files:
-                      download_and_upload(file["url"], bucket_name, file["s3_key"])
+                      logger.info(f"Files to process: {files}")
+                      logger.info(f"Target bucket: {bucket_name}")
 
-                  # Send success response back to CloudFormation
-                  cfnresponse.send(
-                      event,
-                      context,
-                      cfnresponse.SUCCESS,
-                      {},
-                      physical_resource_id=event.get("PhysicalResourceId"),
-                  )
+                      for file in files:
+                          download_and_upload(file["url"], bucket_name, file["s3_key"])
 
-                  return {
-                      "statusCode": 200,
-                      "body": json.dumps("Files uploaded to S3 successfully!"),
-                  }
-
-              except KeyError as e:
-                  logger.error(f"Missing key in event: {e}")
-                  cfnresponse.send(
-                      event, context, cfnresponse.FAILED, {"Error": "Missing key in event"}
-                  )
+                      response_data = {"Message": f"Successfully processed {len(files)} files"}
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                      logger.info("Successfully processed files")
+                  else:
+                      logger.error(f"Unexpected RequestType: {event['RequestType']}")
+                      cfnresponse.send(
+                          event, context, cfnresponse.FAILED, {"Error": "Unexpected RequestType"}
+                      )
 
               except Exception as e:
-                  logger.error(f"Error in handler: {e}")
-                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
-                  # return {"statusCode": 500, "body": json.dumps(f"Error: {e}")}
+                  logger.error(f"Error in lambda_handler: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+
+              finally:
+                  # Attempt to delete the bucket if the stack is being deleted, even if there was an error
+                  if event["RequestType"] == "Delete":
+                      try:
+                          stack_id = event["StackId"]
+                          stack_name = stack_id.split("/")[-2]  # Extract stack name from ARN
+                          stack = cloudformation.describe_stacks(StackName=stack_name)["Stacks"][
+                              0
+                          ]
+                          if stack["StackStatus"] in ["DELETE_FAILED", "ROLLBACK_FAILED"]:
+                              bucket_name = event["ResourceProperties"].get("bucket_name")
+                              if bucket_name:
+                                  delete_bucket(bucket_name)
+                                  logger.info(f"Successfully deleted bucket: {bucket_name} after failed deployment")
+                      except Exception as e:
+                          logger.error(f"Error during final bucket deletion attempt: {str(e)}")
 
   LambdaPermission:
     Type: AWS::Lambda::Permission
@@ -256,8 +288,9 @@ Resources:
 
   LambdaInvoke:
     Type: AWS::CloudFormation::CustomResource
-    DependsOn: LambdaPermission
+    # DependsOn: LambdaPermission
     Properties:
+      ServiceTimeOut: 300
       ServiceToken: !GetAtt LambdaFunction.Arn
       files:
         - url: !Ref GitHubRawFileURL1
